@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import plugin from "../v2.js";
+import serverEntry from "../server.js";
 import { existsSync, readFileSync } from "fs";
 
 vi.mock("fs", () => ({
@@ -47,6 +48,12 @@ describe("OpenCode v2 plugin", () => {
   it("exports the v2 definition shape", () => {
     expect(plugin.id).toBe("opencode-rate-limit-fallback");
     expect(plugin.setup).toBeTypeOf("function");
+  });
+
+  it("serves the v2 definition through the local-loading server entry", () => {
+    // OpenCode's local plugin loader probes `server` before `index` at the
+    // directory root; `server.ts` must hand it the same v2 definition.
+    expect(serverEntry).toBe(plugin);
   });
 
   it("uses the configured cooldown as the base of exponential backoff", async () => {

@@ -23,6 +23,7 @@
   "include": [
     "index.ts",
     "v2.ts",
+    "server.ts",
     "logger.ts",
     "src/**/*.ts"
   ],

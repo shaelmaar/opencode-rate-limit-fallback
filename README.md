@@ -100,6 +100,23 @@ model at once — no retry, backoff, or cooldown — whatever the status code. S
 
 OpenCode will automatically install the plugin on startup.
 
+### Loading from a local checkout
+
+Point `plugins` at the repository directory:
+
+```jsonc
+{
+  "plugins": ["/absolute/path/to/opencode-rate-limit-fallback"]
+}
+```
+
+OpenCode's loader for a local plugin directory probes `server` (this
+repository's OpenCode v2 entry, `server.ts`) before `index` (the legacy
+OpenCode v1 entry), without following `package.json` `main`/`exports`. The
+TypeScript sources are loaded directly, so no build is required; run
+`npm run build` only to produce `dist/` for npm publishing. Restart OpenCode
+(`opencode service restart`) after changing the plugin sources.
+
 This release is tested with OpenCode `1.18.16`. Older OpenCode releases may
 fail to install the matching plugin SDK dependencies; upgrade OpenCode before
 installing this plugin.
