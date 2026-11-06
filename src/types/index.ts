@@ -212,6 +212,14 @@ export interface ErrorPattern {
 export interface ErrorPatternsConfig {
   custom?: ErrorPattern[];
   ignorePatterns?: readonly (string | RegExp)[];
+  /**
+   * OpenCode v2 only: regular expressions (plain phrases work too) matched
+   * case-insensitively against the error text. A match means "this model is
+   * unavailable" (for example a subscription restriction): the plugin switches
+   * to the next fallback model at once, without retry, backoff, or cooldown,
+   * regardless of the HTTP status code.
+   */
+  additionalPatterns?: readonly string[];
   enableLearning?: boolean;
   learnedPatterns?: LearnedPattern[];
   autoApproveThreshold?: number;

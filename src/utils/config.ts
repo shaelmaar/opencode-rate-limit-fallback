@@ -93,6 +93,12 @@ function isValidIgnorePattern(value: unknown): value is string | RegExp {
   return (typeof value === 'string' && value.trim().length > 0) || value instanceof RegExp;
 }
 
+function isValidAdditionalPattern(value: unknown): value is string {
+  // Whether the string compiles as a regular expression is checked later, at
+  // compile time, so one broken entry cannot disable the whole list.
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
 /**
  * Validate configuration values
  */
@@ -111,6 +117,9 @@ export function validateConfig(config: Partial<PluginConfig>): PluginConfig {
   const ignorePatterns = Array.isArray(errorPatterns?.ignorePatterns)
     ? errorPatterns.ignorePatterns.filter(isValidIgnorePattern)
     : [...(DEFAULT_ERROR_PATTERNS_CONFIG.ignorePatterns ?? [])];
+  const additionalPatterns = Array.isArray(errorPatterns?.additionalPatterns)
+    ? (errorPatterns.additionalPatterns as readonly unknown[]).filter(isValidAdditionalPattern)
+    : [];
   const customPatterns = Array.isArray(errorPatterns?.custom)
     ? errorPatterns.custom.filter(isValidErrorPattern)
     : undefined;
@@ -187,6 +196,7 @@ export function validateConfig(config: Partial<PluginConfig>): PluginConfig {
       ...errorPatterns,
       custom: customPatterns,
       ignorePatterns,
+      additionalPatterns,
       learnedPatterns,
       enableLearning,
       autoApproveThreshold,

@@ -34,7 +34,7 @@ OpenCode v2 / Web uses the `plugins` key:
 
 ```json
 {
-  "plugins": ["@azumag/opencode-rate-limit-fallback@2.1.0"]
+  "plugins": ["@azumag/opencode-rate-limit-fallback@2.2.0"]
 }
 ```
 
@@ -79,6 +79,11 @@ OpenCode stops retrying a turn after its own retry limit even when the plugin
 asks for another try. When such a turn fails with a rate limit or transient
 upstream error, the plugin resumes it once the next try is due. A turn that was
 interrupted (by the user, or by a bot that gave up) is not resumed.
+
+Errors whose text matches a pattern in `errorPatterns.additionalPatterns` (for
+example a subscription restriction reported as HTTP 400) switch to the next
+model at once — no retry, backoff, or cooldown — whatever the status code. See
+[Additional Fallback-Only Patterns](#additional-fallback-only-patterns-opencode-v2).
 
 ```json
 {
@@ -174,7 +179,7 @@ Create a configuration file at one of these locations:
    | `enableSubagentFallback` | boolean | `true` | Enable/disable fallback for subagent sessions |
   | `retryPolicy` | object | See below | Retry policy configuration (see below) |
   | `circuitBreaker` | object | See below | Circuit breaker configuration (see below) |
-  | `errorPatterns` | object | See below | Advanced rate-limit matching overrides and false-positive ignores |
+  | `errorPatterns` | object | See below | Advanced rate-limit matching overrides, false-positive ignores, and v2 fallback-only error patterns |
   | `configReload` | object | See below | Configuration hot reload settings (see below) |
   | `dynamicPrioritization` | object | See below | Dynamic prioritization settings (see below) |
 
@@ -207,6 +212,31 @@ Use `errorPatterns.ignorePatterns` to add your own false-positive suppressions:
 ```
 
 The configured array replaces the built-in list. Include the built-in entries when extending it, as shown above. Set it to `[]` to disable ignore matching entirely. Entries must be non-empty strings (or `RegExp` values when configuring the plugin programmatically), and changes are applied by config hot reload.
+
+### Additional Fallback-Only Patterns (OpenCode v2)
+
+Some providers deny access to a model with a plain `400` response whose text makes clear the model is unavailable on the current plan (for example "current subscription plan does not yet include access to GLM"). That is not a rate limit: retrying the same model cannot help. List such messages in `errorPatterns.additionalPatterns` to switch to the next fallback model at once:
+
+```json
+{
+  "errorPatterns": {
+    "additionalPatterns": [
+      "current subscription plan does not yet include access to",
+      "not included in subscription"
+    ]
+  }
+}
+```
+
+- Entries are regular expressions (plain phrases work as regex), matched case-insensitively.
+- The error's human-readable text is matched, including text nested in `cause`, `data`, `response`, `body`, or `error` fields. The error object is never serialized wholesale, so unrelated fields and secrets are not matched or logged.
+- A match switches to the next model in `fallbackModels` regardless of the HTTP status code (including `400`), without `retryPolicy`, exponential backoff, or cooldown for that error. The usual one-second switch delay still applies.
+- A match takes priority over the built-in rate-limit classification: an error that looks like `429` but matches a pattern still switches instead of waiting.
+- When the chain has no model left, the turn is failed (as `"stop"` mode does) — even in `"cycle"` mode the plugin does not wait or cycle back to a model the error text declared unavailable.
+- Invalid regular expressions are skipped when the plugin loads; the remaining patterns keep working.
+- Matching cost is bounded: at most 50 patterns are compiled, each at most 256 characters, and at most 8192 characters of error text are scanned (nesting depth and array length are capped too). Patterns run on JavaScript's backtracking regex engine, so avoid catastrophic patterns such as `(a+)+$`.
+
+This option is consumed by the OpenCode v2 entry point. The patterns are compiled once at plugin startup together with the rest of the config, so changing them takes effect the next time OpenCode loads the plugin (config hot reload applies to the v1 entry point only). Subagent sessions are handled like any other session: the same patterns apply to them.
 
 ### Automatic Pattern Learning
 

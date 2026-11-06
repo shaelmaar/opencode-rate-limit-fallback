@@ -575,5 +575,204 @@ describe("OpenCode v2 plugin", () => {
       expect(t.prompt).not.toHaveBeenCalled();
       await t.cleanup?.();
     });
+
+    describe("errorPatterns.additionalPatterns", () => {
+      type Harness = Awaited<ReturnType<typeof setupFallback>>;
+      const MATCHERS = {
+        additionalPatterns: ["current subscription plan does not yet include access to", "not included in subscription"],
+      };
+
+      /** Fail with an arbitrary error object (the built-in fail() always sends 429). */
+      const failWith = async (
+        t: Harness,
+        error: unknown,
+        model: { providerID: string; id: string } = GLM,
+        attempt = 1,
+      ) => {
+        const event = {
+          sessionID: "session-1",
+          model,
+          attempt,
+          error,
+          decision: { retry: false } as any,
+        };
+        await t.retry(event);
+        return event.decision;
+      };
+
+      it("switches to the next model at once on a subscription-style HTTP 400", async () => {
+        const t = await setupFallback("cycle", GLM, { errorPatterns: MATCHERS });
+        const decision = await failWith(t, {
+          status: 400,
+          type: "provider",
+          message: "current subscription plan does not yet include access to GLM",
+        });
+        expect(decision).toEqual({ retry: true, delay: 1000 }); // switch delay, not a cooldown
+        expect(t.switchModel).toHaveBeenCalledWith({ sessionID: "session-1", model: DEEPSEEK });
+        expect(t.model()).toEqual(DEEPSEEK);
+        await t.cleanup?.();
+      });
+
+      it("matches the second configured phrase", async () => {
+        const t = await setupFallback("cycle", GLM, { errorPatterns: MATCHERS });
+        const decision = await failWith(t, { status: 400, message: "This model is not included in subscription" });
+        expect(decision).toEqual({ retry: true, delay: 1000 });
+        expect(t.model()).toEqual(DEEPSEEK);
+        await t.cleanup?.();
+      });
+
+      it("matches regardless of message case", async () => {
+        const t = await setupFallback("cycle", GLM, { errorPatterns: MATCHERS });
+        const decision = await failWith(t, {
+          status: 400,
+          message: "Current Subscription Plan Does NOT Yet Include Access To GLM",
+        });
+        expect(decision).toEqual({ retry: true, delay: 1000 });
+        expect(t.model()).toEqual(DEEPSEEK);
+        await t.cleanup?.();
+      });
+
+      it("leaves an ordinary HTTP 400 validation error to OpenCode", async () => {
+        const t = await setupFallback("cycle", GLM, { errorPatterns: MATCHERS });
+        const decision = await failWith(t, { status: 400, message: "Invalid request: missing required field" });
+        expect(decision).toEqual({ retry: false });
+        expect(t.switchModel).not.toHaveBeenCalled();
+        await t.cleanup?.();
+      });
+
+      it("keeps the existing retry behavior for an unmatched HTTP 429", async () => {
+        const t = await setupFallback("cycle", GLM, { errorPatterns: MATCHERS });
+        expect(await t.fail(2)).toEqual({ retry: true, delay: 1000 }); // GLM -> DeepSeek
+        expect(await t.fail(3)).toEqual({ retry: true, delay: 60000 }); // exhausted -> cooldown, as before
+        expect(t.model()).toEqual(GLM);
+        await t.cleanup?.();
+      });
+
+      it("keeps leaving an unmatched HTTP 503 to OpenCode", async () => {
+        const t = await setupFallback("cycle", GLM, { errorPatterns: MATCHERS });
+        const decision = await failWith(t, { status: 503, message: "Service Unavailable" });
+        expect(decision).toEqual({ retry: false });
+        expect(t.switchModel).not.toHaveBeenCalled();
+        await t.cleanup?.();
+      });
+
+      it("prefers the pattern over the 429 classification and never cycles back", async () => {
+        const t = await setupFallback("cycle", GLM, { errorPatterns: MATCHERS });
+        expect(await t.fail(2)).toEqual({ retry: true, delay: 1000 }); // GLM -> DeepSeek (plain 429)
+        expect(t.model()).toEqual(DEEPSEEK);
+        // DeepSeek fails 429 WITH a matching message: no cooldown, no return to GLM.
+        const decision = await failWith(t, {
+          status: 429,
+          message: "Too many requests, and this model is not included in subscription",
+        }, DEEPSEEK);
+        expect(decision).toEqual({ retry: false });
+        expect(t.switchModel).toHaveBeenCalledTimes(1); // only the first switch happened
+        expect(t.model()).toEqual(DEEPSEEK);
+        await t.cleanup?.();
+      });
+
+      it("does not wait out a matched error in wait mode", async () => {
+        const t = await setupFallback("wait", GLM, { errorPatterns: MATCHERS });
+        const decision = await failWith(t, {
+          status: 429,
+          message: "Too many requests, and this model is not included in subscription",
+        });
+        expect(decision).toEqual({ retry: false }); // not { retry: true, delay: 60000 }
+        expect(t.switchModel).not.toHaveBeenCalled();
+        await t.cleanup?.();
+      });
+
+      it("matches text nested in cause", async () => {
+        const t = await setupFallback("cycle", GLM, { errorPatterns: MATCHERS });
+        const decision = await failWith(t, {
+          status: 400,
+          message: "Provider rejected the request",
+          cause: { message: "current subscription plan does not yet include access to glm-5.3" },
+        });
+        expect(decision).toEqual({ retry: true, delay: 1000 });
+        expect(t.model()).toEqual(DEEPSEEK);
+        await t.cleanup?.();
+      });
+
+      it("matches text deeply nested under data and response", async () => {
+        const t = await setupFallback("cycle", GLM, { errorPatterns: MATCHERS });
+        const decision = await failWith(t, {
+          status: 400,
+          data: { response: { body: { error: { message: "This model is not included in subscription" } } } },
+        });
+        expect(decision).toEqual({ retry: true, delay: 1000 });
+        expect(t.model()).toEqual(DEEPSEEK);
+        await t.cleanup?.();
+      });
+
+      it("matches text inside arrays such as data.errors", async () => {
+        const t = await setupFallback("cycle", GLM, { errorPatterns: MATCHERS });
+        const decision = await failWith(t, {
+          status: 400,
+          data: { errors: [{ detail: "not included in subscription" }] },
+        });
+        expect(decision).toEqual({ retry: true, delay: 1000 });
+        expect(t.model()).toEqual(DEEPSEEK);
+        await t.cleanup?.();
+      });
+
+      it("changes nothing when additionalPatterns is empty", async () => {
+        const t = await setupFallback("cycle", GLM, { errorPatterns: { additionalPatterns: [] } });
+        const decision = await failWith(t, {
+          status: 400,
+          message: "current subscription plan does not yet include access to GLM",
+        });
+        expect(decision).toEqual({ retry: false });
+        expect(t.switchModel).not.toHaveBeenCalled();
+        await t.cleanup?.();
+      });
+
+      it("skips an invalid regular expression and keeps the valid one", async () => {
+        const t = await setupFallback("cycle", GLM, {
+          errorPatterns: { additionalPatterns: ["([unclosed", "not included in subscription"] },
+        });
+        const decision = await failWith(t, { status: 400, message: "This model is not included in subscription" });
+        expect(decision).toEqual({ retry: true, delay: 1000 });
+        expect(t.model()).toEqual(DEEPSEEK);
+        await t.cleanup?.();
+      });
+
+      it("resumes a ceiling failure on the next model at once, without cooldown", async () => {
+        vi.useFakeTimers();
+        const t = await setupFallback("cycle", GLM, {
+          fallbackModels: [
+            { providerID: GLM.providerID, modelID: GLM.id },
+            { providerID: DEEPSEEK.providerID, modelID: DEEPSEEK.id },
+            { providerID: OTHER.providerID, modelID: OTHER.id },
+          ],
+          errorPatterns: MATCHERS,
+        });
+        await t.fail(2); // GLM -> DeepSeek: a streak exists
+        t.events.push({
+          type: "session.execution.failed",
+          data: { sessionID: "session-1", error: { status: 400, message: "This model is not included in subscription" } },
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(t.model()).toEqual(OTHER); // switched at once
+        await vi.advanceTimersByTimeAsync(999);
+        expect(t.prompt).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(t.prompt).toHaveBeenCalledWith({ sessionID: "session-1", text: "", resume: true });
+        await t.cleanup?.();
+      });
+
+      it("does not resume a ceiling failure when the chain is exhausted", async () => {
+        vi.useFakeTimers();
+        const t = await setupFallback("cycle", GLM, { errorPatterns: MATCHERS });
+        await t.fail(2); // GLM -> DeepSeek: a streak exists, no model after DeepSeek
+        t.events.push({
+          type: "session.execution.failed",
+          data: { sessionID: "session-1", error: { status: 400, message: "This model is not included in subscription" } },
+        });
+        await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+        expect(t.prompt).not.toHaveBeenCalled(); // no cooldown resume, no infinite loop
+        await t.cleanup?.();
+      });
+    });
   });
 });

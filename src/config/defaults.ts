@@ -161,6 +161,7 @@ export const DEFAULT_ERROR_PATTERNS_CONFIG = {
     'not your plan limits',
     'draw from your extra usage',
   ],
+  additionalPatterns: [],
   enableLearning: false,
   autoApproveThreshold: 0.8,
   maxLearnedPatterns: 20,

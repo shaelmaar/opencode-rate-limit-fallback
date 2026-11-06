@@ -97,6 +97,23 @@ describe('config utilities', () => {
     ]);
   });
 
+  it('filters invalid additional pattern entries before runtime matching', () => {
+    const config = validateConfig({
+      errorPatterns: {
+        additionalPatterns: ['not included in subscription', null, 123, '   ', ['nested']],
+      },
+    } as unknown as Partial<PluginConfig>);
+
+    expect(config.errorPatterns?.additionalPatterns).toEqual(['not included in subscription']);
+  });
+
+  it('defaults additionalPatterns to an empty list', () => {
+    expect(validateConfig({}).errorPatterns?.additionalPatterns).toEqual([]);
+    expect(validateConfig({ errorPatterns: {} }).errorPatterns?.additionalPatterns).toEqual([]);
+    expect(validateConfig({ errorPatterns: { additionalPatterns: 'nope' } } as unknown as Partial<PluginConfig>).errorPatterns?.additionalPatterns).toEqual([]);
+    expect(validateConfig({ errorPatterns: { additionalPatterns: null } } as unknown as Partial<PluginConfig>).errorPatterns?.additionalPatterns).toEqual([]);
+  });
+
   it('filters malformed custom and learned patterns before runtime use', () => {
     const validCustom = {
       name: 'provider-capacity',

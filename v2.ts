@@ -88,6 +88,92 @@ function isRetryableError(value: unknown): boolean {
   return RETRYABLE_ERROR_PATTERNS.some((pattern) => pattern.test(text));
 }
 
+/** Keys whose string values are human-readable error text worth matching. */
+const ERROR_TEXT_KEYS = ["message", "type", "code", "responseBody", "statusText", "detail", "details", "reason", "title"] as const;
+
+/** Keys whose values may nest further error information. */
+const ERROR_NEST_KEYS = ["cause", "data", "response", "body", "error", "errors"] as const;
+
+// Caps that bound the cost of matching user-supplied regular expressions.
+const MAX_ADDITIONAL_PATTERNS = 50;
+const MAX_PATTERN_SOURCE_LENGTH = 256;
+const MAX_ERROR_TEXT_LENGTH = 8192;
+const MAX_ERROR_TEXT_DEPTH = 6;
+const MAX_ERROR_ARRAY_ITEMS = 20;
+
+/**
+ * Compile `errorPatterns.additionalPatterns` into case-insensitive regexes.
+ * Entries that are not non-empty strings, or do not compile, are skipped so
+ * one broken rule never disables the rest or crashes the plugin.
+ */
+function compileAdditionalPatterns(patterns: readonly unknown[] | undefined): RegExp[] {
+  if (!Array.isArray(patterns)) return [];
+  const compiled: RegExp[] = [];
+  const seen = new Set<string>();
+  for (const entry of patterns) {
+    if (compiled.length >= MAX_ADDITIONAL_PATTERNS) break;
+    if (typeof entry !== "string") continue;
+    const source = entry.trim();
+    if (source.length === 0 || source.length > MAX_PATTERN_SOURCE_LENGTH) continue;
+    const key = source.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      compiled.push(new RegExp(source, "i"));
+    } catch {
+      // Not a valid regular expression: skip it, keep the other rules.
+    }
+  }
+  return compiled;
+}
+
+function collectErrorText(value: unknown, depth: number, seen: Set<object>, parts: string[]): void {
+  if (typeof value === "string") {
+    if (value.length > 0) parts.push(value);
+    return;
+  }
+  // Never serialize the whole object: only known human-readable keys are read,
+  // so unrelated fields (and any secrets they hold) cannot be matched or logged.
+  if (value === null || typeof value !== "object" || depth <= 0 || seen.has(value)) return;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value.slice(0, MAX_ERROR_ARRAY_ITEMS)) {
+      collectErrorText(item, depth - 1, seen, parts);
+    }
+    return;
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of ERROR_TEXT_KEYS) {
+    const text = record[key];
+    if (typeof text === "string" && text.length > 0) parts.push(text);
+  }
+  for (const key of ERROR_NEST_KEYS) {
+    if (key in record) collectErrorText(record[key], depth - 1, seen, parts);
+  }
+}
+
+/**
+ * The human-readable text of an error: its message-ish fields plus the same
+ * fields of objects nested under `cause`, `data`, `response`, ... Cyclic
+ * references and nesting depth are bounded.
+ */
+function errorText(value: unknown): string {
+  const parts: string[] = [];
+  collectErrorText(value, MAX_ERROR_TEXT_DEPTH, new Set(), parts);
+  return parts.join(" ").slice(0, MAX_ERROR_TEXT_LENGTH);
+}
+
+/**
+ * True when the error text matches a user-configured pattern: the model is
+ * unavailable on it (for example a subscription restriction), so fail over
+ * without retrying it.
+ */
+function isFallbackOnlyError(value: unknown, patterns: readonly RegExp[]): boolean {
+  if (patterns.length === 0) return false;
+  const text = errorText(value);
+  return text.length > 0 && patterns.some((pattern) => pattern.test(text));
+}
+
 function effectiveCooldown(cooldownMs: number | undefined): number {
   return Math.max(1000, cooldownMs ?? 60000);
 }
@@ -158,6 +244,9 @@ export default {
     const handles = (model: ModelRef | undefined) =>
       mode === "wait" || otherModels === "wait" || fallbacks.some((candidate) => sameModel(candidate, model));
     const cooldownMs = effectiveCooldown(config.cooldownMs);
+    // Compiled once here: like the rest of the config, the patterns are read
+    // at setup and a change takes effect the next time the plugin is loaded.
+    const additionalPatterns = compileAdditionalPatterns(config.errorPatterns?.additionalPatterns);
     const resumeTimers = new Map<string, ReturnType<typeof setTimeout>>();
     const streaks = new Map<string, Streak>();
 
@@ -209,8 +298,14 @@ export default {
     };
 
     // `failed` just failed with a retryable error: select the model for the
-    // next try and say when it is due.
-    const decide = async (sessionID: string, failed: ModelRef | undefined): Promise<RetryEvent["decision"]> => {
+    // next try and say when it is due. `fallbackOnly` marks an error whose
+    // text matched a user pattern: the model is unavailable, so when there is
+    // no next model the turn ends instead of waiting or cycling back.
+    const decide = async (
+      sessionID: string,
+      failed: ModelRef | undefined,
+      fallbackOnly = false,
+    ): Promise<RetryEvent["decision"]> => {
       let streak = streaks.get(sessionID);
       let position = streak?.chain.findIndex((model) => sameModel(model, failed)) ?? -1;
       if (!streak || (failed !== undefined && position < 0)) {
@@ -226,6 +321,12 @@ export default {
       if (next !== undefined && !(await switchModel(sessionID, next))) next = undefined;
       if (next === undefined) {
         // Every model in the chain failed on this pass (or switching is not possible).
+        if (fallbackOnly) {
+          // The error text says the model is unavailable (for example a
+          // subscription restriction): retrying or cycling back to it cannot
+          // help, so end the turn, even in "cycle" mode.
+          return { retry: false };
+        }
         if (mode === "stop" && streak.chain.length > 1) return { retry: false };
         streak.passes += 1;
         delay = exponentialDelay(cooldownMs, streak.passes);
@@ -250,9 +351,12 @@ export default {
     });
 
     const retryRegistration = await context.session.hook("retry", async (event) => {
-      if (!isRetryableError(event.error) || !handles(event.model)) return;
+      // A user-configured pattern wins over the retry classification: the
+      // error text says this model is unavailable, whatever the status code.
+      const fallbackOnly = isFallbackOnlyError(event.error, additionalPatterns);
+      if ((!fallbackOnly && !isRetryableError(event.error)) || !handles(event.model)) return;
       cancelResume(event.sessionID);
-      event.decision = await decide(event.sessionID, event.model);
+      event.decision = await decide(event.sessionID, event.model, fallbackOnly);
     });
 
     // OpenCode has its own ceiling on retries and fails the turn once it is
@@ -269,10 +373,12 @@ export default {
       }
       if (event.type !== "session.execution.failed") return;
       const streak = streaks.get(sessionID);
-      if (!streak || !isRetryableError(event.data?.error)) return;
+      if (!streak) return;
+      const fallbackOnly = isFallbackOnlyError(event.data?.error, additionalPatterns);
+      if (!fallbackOnly && !isRetryableError(event.data?.error)) return;
       const failed = (await currentModel(sessionID)) ?? streak.selected ?? streak.original;
       if (!handles(failed)) return;
-      const decision = await decide(sessionID, failed);
+      const decision = await decide(sessionID, failed, fallbackOnly);
       if (decision.retry) scheduleResume(sessionID, decision.delay);
     };
     const watch = async (events: NonNullable<V2Context["event"]>) => {
